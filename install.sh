@@ -497,9 +497,12 @@ _generate_supabase_jwt() {
   now=$(date +%s)
   exp=$(( now + 5 * 365 * 24 * 3600 ))  # 5 years
 
-  # Base64url-encode a string (no padding)
+  # Base64url-encode a string (no padding).
+  # GNU base64 wraps output at 76 chars by default while BSD base64 does not,
+  # so we explicitly strip newlines — without this, JWTs longer than 76 chars
+  # contain embedded \n on Linux and break downstream sed templating.
   _b64url() {
-    printf '%s' "${1}" | base64 | tr '+/' '-_' | tr -d '='
+    printf '%s' "${1}" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '='
   }
 
   local header
@@ -516,6 +519,7 @@ _generate_supabase_jwt() {
   sig=$(printf '%s' "${unsigned}" \
     | openssl dgst -sha256 -hmac "${secret}" -binary \
     | base64 \
+    | tr -d '\n' \
     | tr '+/' '-_' \
     | tr -d '=')
 
