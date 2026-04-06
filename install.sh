@@ -255,6 +255,7 @@ check_ram() {
       warn "Non-interactive mode: continuing despite low RAM."
     else
       echo ""
+      ensure_tty_stdin
       read -rp "RAM is below minimum (${MIN_RAM_GB}GB). Continue anyway? [y/N] " confirm
       if [[ "${confirm}" != "y" && "${confirm}" != "Y" ]]; then
         fatal "Aborted by user due to insufficient RAM."
@@ -538,6 +539,31 @@ detect_existing_install() {
 # INTERACTIVE PROMPTS
 # ============================================================
 
+# ensure_tty_stdin — re-attach stdin to the controlling terminal so that
+# `read` prompts work even when the script was invoked via `curl ... | bash`.
+#
+# When you pipe curl into bash, bash's stdin is the curl output stream, not
+# the keyboard — so any `read` call returns EOF immediately and prompts get
+# silently skipped. The fix is to redirect stdin from /dev/tty.
+#
+# This is only safe when a controlling terminal actually exists. In CI or
+# truly headless contexts /dev/tty won't be readable; in that case we leave
+# stdin alone and the operator should pass --non-interactive with all flags.
+#
+# Idempotent: only swaps stdin once per process, only when needed.
+ensure_tty_stdin() {
+  # Already on a TTY — nothing to do.
+  if [ -t 0 ]; then
+    return 0
+  fi
+  # No controlling terminal available — give up silently and let read fail.
+  if [ ! -r /dev/tty ]; then
+    warn "No TTY available for prompts. Pass --non-interactive with all flags, or download the script and run it directly."
+    return 0
+  fi
+  exec </dev/tty
+}
+
 # prompt_if_empty — prompt the user for a value if the variable is empty.
 # Skipped entirely in --non-interactive mode.
 # Arguments:
@@ -621,6 +647,12 @@ gather_config() {
   bold ""
   bold "=== Chyro Installation Configuration ==="
   echo ""
+
+  # Re-attach stdin to the controlling terminal so prompts work even when
+  # the script was piped into bash via curl. No-op if stdin is already a TTY.
+  if [[ "${NON_INTERACTIVE}" == "false" ]]; then
+    ensure_tty_stdin
+  fi
 
   # Domain
   local domain_default=""
@@ -1415,6 +1447,7 @@ main() {
       warn "Non-interactive mode: existing installation will be updated without destroying data."
     else
       echo ""
+      ensure_tty_stdin
       read -rp "Existing installation found. Continue and update (data is preserved)? [y/N] " confirm
       if [[ "${confirm}" != "y" && "${confirm}" != "Y" ]]; then
         info "Aborting. To upgrade, use --upgrade flag."
