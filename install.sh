@@ -65,6 +65,7 @@ NC='\033[0m' # No Color
 # ============================================================
 
 LICENSE_KEY=""
+CONSOLE_URL="${CONSOLE_URL:-https://chyroconsole.soula.ge}"
 DOMAIN=""
 APP_NAME="Chyro"
 ADMIN_EMAIL=""
@@ -97,6 +98,7 @@ parse_args() {
   for arg in "$@"; do
     case "${arg}" in
       --license=*)       LICENSE_KEY="${arg#*=}" ;;
+      --console-url=*)   CONSOLE_URL="${arg#*=}" ;;
       --domain=*)        DOMAIN="${arg#*=}" ;;
       --app-name=*)      APP_NAME="${arg#*=}" ;;
       --admin-email=*)   ADMIN_EMAIL="${arg#*=}" ;;
@@ -125,7 +127,8 @@ USAGE:
   bash install.sh [OPTIONS]
 
 OPTIONS:
-  --license=<KEY>           License key (required for fresh install)
+  --license=<KEY>           License key — short code (CHYRO-...) or JWT (required)
+  --console-url=<URL>       Chyro Console base URL (default: https://chyroconsole.soula.ge)
   --domain=<DOMAIN>         Your domain (e.g. chyro.example.com)
   --app-name=<NAME>         App display name (default: Chyro)
   --admin-email=<EMAIL>     First admin user email
@@ -298,15 +301,92 @@ check_tools() {
 # LICENSE VALIDATION
 # ============================================================
 
+# exchange_short_code — exchange a CHYRO-* short code for the full JWT by
+# calling the public Console activation endpoint. Sets the global LICENSE_KEY
+# to the returned JWT so the rest of the JWT-decode path runs unchanged.
+#
+# Also sends domain + version as query params so the Console operator can see
+# who activated, where, and with what installer version.
+exchange_short_code() {
+  local code="${1}"
+  local url="${CONSOLE_URL}/api/licenses/exchange/${code}"
+
+  # Append optional context (domain, version) for the activation log.
+  local query=""
+  if [[ -n "${DOMAIN}" ]]; then
+    query="?domain=${DOMAIN}"
+  fi
+  if [[ -n "${CHYRO_VERSION}" ]]; then
+    if [[ -n "${query}" ]]; then
+      query="${query}&version=${CHYRO_VERSION}"
+    else
+      query="?version=${CHYRO_VERSION}"
+    fi
+  fi
+
+  info "Activating license code ${code} via ${CONSOLE_URL}…"
+
+  local response http_code body
+  # -w writes the HTTP status on the last line so we can split body / status.
+  response=$(curl -sS -w "\n%{http_code}" \
+    -H "User-Agent: chyro-install/${CHYRO_VERSION}" \
+    "${url}${query}" 2>&1) || {
+    fatal "Could not reach Chyro Console at ${CONSOLE_URL}. Check network and try again."
+  }
+
+  http_code=$(echo "${response}" | tail -n1)
+  body=$(echo "${response}" | sed '$d')
+
+  case "${http_code}" in
+    200)
+      ;;
+    404)
+      fatal "License code '${code}' was not recognized. Double-check the key in the Chyro Console."
+      ;;
+    403)
+      fatal "License code '${code}' has been revoked. Contact your Chyro administrator."
+      ;;
+    429)
+      fatal "Too many activation attempts. Wait a minute and try again."
+      ;;
+    *)
+      fatal "License activation failed (HTTP ${http_code}): ${body}"
+      ;;
+  esac
+
+  # Parse {"jwt": "...", "public_key": "..."} without requiring jq.
+  local jwt
+  jwt=$(echo "${body}" | sed -n 's/.*"jwt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
+  if [[ -z "${jwt}" ]]; then
+    fatal "Console returned no JWT for code '${code}'. Response: ${body}"
+  fi
+
+  # Replace the license key with the full JWT — the rest of validate_license
+  # parses it as before, no other changes needed downstream.
+  LICENSE_KEY="${jwt}"
+  success "License code activated"
+}
+
 # validate_license — decode the license JWT header and extract the public key.
 # The license key is a JWT; its header contains the public key used for
 # LICENSE_PUBLIC_KEY in the backend. We extract the header's 'kid' or 'pk' field.
 # This function sets the global LICENSE_PUBLIC_KEY variable.
+#
+# Accepts either a full JWT (header.payload.signature) OR a short code in the
+# form CHYRO-XXX-YYYY-ZZZZZZZZ. Short codes are exchanged for the JWT against
+# the Console activation endpoint before decoding.
 validate_license() {
   local license="${1}"
 
   if [[ -z "${license}" ]]; then
     fatal "License key is required. Pass --license=<KEY>."
+  fi
+
+  # Detect short-code format and exchange for the full JWT.
+  if [[ "${license}" =~ ^CHYRO-[A-Z0-9]+-[0-9]{4}-[A-Z0-9]+$ ]]; then
+    exchange_short_code "${license}"
+    license="${LICENSE_KEY}"
   fi
 
   # Basic JWT structure check: three dot-separated base64url segments
@@ -614,8 +694,9 @@ generate_env_file() {
 
   success "All secrets generated"
 
-  # Store anon_key globally for config.js generation
+  # Store keys globally for config.js and kong.yml generation
   GENERATED_ANON_KEY="${anon_key}"
+  GENERATED_SERVICE_ROLE_KEY="${service_role_key}"
   GENERATED_JWT_SECRET="${jwt_secret}"
 
   # Protocol prefix for URLs
@@ -885,6 +966,53 @@ setup_volumes_dir() {
         || warn "Failed to download kong.yml — Kong will not start without it"
     fi
   fi
+}
+
+# generate_kong_yml — template the kong.yml API key credentials with the generated
+# Supabase JWT keys. Kong 3.x's declarative config (format_version 2.1) still uses
+# hardcoded key values in the keyauth_credentials block — there is no native env-var
+# substitution in the DB-less declarative config itself without an entrypoint script.
+#
+# Strategy: the source kong.yml ships with the Supabase demo keys (safe for dev,
+# invalid for production). After generate_env_file() runs and sets GENERATED_ANON_KEY
+# and GENERATED_SERVICE_ROLE_KEY, this function replaces those placeholders with the
+# real generated keys using sed in-place.
+#
+# This function MUST be called after generate_env_file() so GENERATED_ANON_KEY and
+# GENERATED_SERVICE_ROLE_KEY are set.
+generate_kong_yml() {
+  local kong_yml="${INSTALL_DIR}/volumes/api/kong.yml"
+
+  if [[ ! -f "${kong_yml}" ]]; then
+    warn "kong.yml not found at ${kong_yml} — skipping key templating"
+    return 0
+  fi
+
+  # Supabase demo JWT keys (anon + service_role) that ship in the source kong.yml.
+  # These are the well-known public demo values — safe to hardcode here as they are
+  # the values we are replacing, not secrets being introduced.
+  local demo_anon_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0"
+  local demo_service_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU"
+
+  # Replace demo service_role key with the generated SERVICE_ROLE_KEY from .env.
+  # Read from the generated .env file since we don't store service_role_key globally.
+  local generated_service_key
+  generated_service_key=$(grep '^SERVICE_ROLE_KEY=' "${INSTALL_DIR}/${ENV_FILE}" | cut -d'=' -f2-)
+
+  if [[ -z "${generated_service_key}" ]]; then
+    warn "Could not read SERVICE_ROLE_KEY from .env — kong.yml service_role key not updated"
+    return 0
+  fi
+
+  # Use sed with .bak suffix for portability (works on both Linux GNU sed and macOS BSD sed).
+  # The backup file is removed immediately after to keep the directory clean.
+  sed -i.bak "s|${demo_anon_key}|${GENERATED_ANON_KEY}|g" "${kong_yml}"
+  rm -f "${kong_yml}.bak"
+
+  sed -i.bak "s|${demo_service_key}|${generated_service_key}|g" "${kong_yml}"
+  rm -f "${kong_yml}.bak"
+
+  success "kong.yml API keys updated with generated production credentials"
 }
 
 # setup_db_init — copy the Supabase database init SQL to the install directory.
@@ -1316,11 +1444,17 @@ main() {
   # 8. Generate secrets and write .env
   generate_env_file
 
+  # 8b. Template kong.yml with generated JWT keys (replaces Supabase demo keys)
+  generate_kong_yml
+
   # 9. Write Caddyfile
   generate_caddyfile
 
   # 10. Write frontend/public/config.js
   generate_config_js
+
+  # 10b. Template kong.yml with production JWT keys
+  generate_kong_yml
 
   # 11. Pull images
   pull_images
