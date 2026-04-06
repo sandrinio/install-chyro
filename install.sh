@@ -355,7 +355,8 @@ exchange_short_code() {
       ;;
   esac
 
-  # Parse {"jwt": "...", "public_key": "..."} without requiring jq.
+  # Parse {"jwt": "...", "public_key": "...", "registry_user": "...",
+  # "registry_password": "..."} without requiring jq.
   local jwt
   jwt=$(echo "${body}" | sed -n 's/.*"jwt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 
@@ -363,10 +364,34 @@ exchange_short_code() {
     fatal "Console returned no JWT for code '${code}'. Response: ${body}"
   fi
 
+  # Optional: registry credentials. New consoles return them; older consoles
+  # don't, in which case we leave the globals empty and skip docker login.
+  REGISTRY_USER_FROM_LICENSE=$(echo "${body}" | sed -n 's/.*"registry_user"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  REGISTRY_PASS_FROM_LICENSE=$(echo "${body}" | sed -n 's/.*"registry_password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
   # Replace the license key with the full JWT — the rest of validate_license
   # parses it as before, no other changes needed downstream.
   LICENSE_KEY="${jwt}"
   success "License code activated"
+}
+
+# registry_login — log Docker into registry.chyro.net using credentials the
+# Console handed us during exchange_short_code. Skipped if no creds were
+# returned (older console, manual JWT install, etc.) so the user can still
+# pre-configure docker login themselves.
+registry_login() {
+  if [[ -z "${REGISTRY_USER_FROM_LICENSE:-}" || -z "${REGISTRY_PASS_FROM_LICENSE:-}" ]]; then
+    info "No registry credentials in license response — assuming docker is already logged into ${REGISTRY}."
+    return 0
+  fi
+
+  info "Logging in to ${REGISTRY} as ${REGISTRY_USER_FROM_LICENSE}…"
+  if echo "${REGISTRY_PASS_FROM_LICENSE}" \
+    | docker login "${REGISTRY}" --username "${REGISTRY_USER_FROM_LICENSE}" --password-stdin >/dev/null 2>&1; then
+    success "Registry login successful"
+  else
+    fatal "Registry login failed for ${REGISTRY_USER_FROM_LICENSE}@${REGISTRY}. Contact your Chyro administrator."
+  fi
 }
 
 # validate_license — decode the license JWT header and extract the public key.
@@ -1133,6 +1158,7 @@ setup_branding_dir() {
 # pull_images — pull all Docker images from the registry before starting.
 # This ensures the latest images are used and reduces startup time.
 pull_images() {
+  registry_login
   info "Pulling images from ${REGISTRY}..."
   cd "${INSTALL_DIR}"
 
